@@ -318,3 +318,24 @@ pub fn launch(
 
     launch_virtual_dom(virtual_dom, platform_config)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_event_loop_ticks_before_automatic_webview_resize() {
+        let source = include_str!("launch.rs");
+        let embedded_loop = source
+            .split_once("event_loop.run_return")
+            .and_then(|(_, body)| body.split_once("Event::UserEvent(event)"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("embedded event-loop ordering must remain inspectable"));
+        let tick = embedded_loop
+            .find("app.tick(&window_event)")
+            .unwrap_or_else(|| panic!("embedded event loop must process application state"));
+        let resize = embedded_loop
+            .find("app.resize_window(window_id, new_size)")
+            .unwrap_or_else(|| panic!("embedded event loop must resize the webview"));
+
+        assert!(tick < resize);
+    }
+}
