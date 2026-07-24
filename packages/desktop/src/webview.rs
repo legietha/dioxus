@@ -218,7 +218,7 @@ impl WebviewInstance {
         mut cfg: Config,
         mut dom: VirtualDom,
         shared: Rc<SharedContext>,
-    ) -> WebviewInstance {
+    ) -> Result<WebviewInstance, Box<dyn std::error::Error>> {
         let mut window = cfg.window.clone();
 
         // tao makes small windows for some reason, make them bigger on desktop
@@ -237,7 +237,8 @@ impl WebviewInstance {
             window = window.with_window_icon(crate::default_icon().ok());
         }
 
-        let window = Arc::new(window.build(&shared.target).unwrap());
+        let window_creation_guard = cfg.try_enter_window_creation_guard()?;
+        let window = Arc::new(window.build(&shared.target)?);
         if let Some(on_build) = cfg.on_window.as_mut() {
             on_build(window.clone(), &mut dom);
         }
@@ -496,7 +497,8 @@ impl WebviewInstance {
             let vbox = window.default_vbox().unwrap();
             webview.build_gtk(vbox)
         };
-        let webview = webview.unwrap();
+        let webview = webview?;
+        drop(window_creation_guard);
 
         let desktop_context = Rc::from(DesktopService::new(
             webview,
@@ -520,14 +522,14 @@ impl WebviewInstance {
         // Request an initial redraw
         desktop_context.window.request_redraw();
 
-        WebviewInstance {
+        Ok(WebviewInstance {
             dom,
             edits,
             waker: tao_waker(shared.proxy.clone(), desktop_context.window.id()),
             desktop_context,
             _menu: menu,
             _web_context: web_context,
-        }
+        })
     }
 
     pub fn poll_vdom(&mut self) {
@@ -652,14 +654,17 @@ impl PendingWebview {
         (webview, pending)
     }
 
-    pub(crate) fn create_window(self, shared: &Rc<SharedContext>) -> WebviewInstance {
-        let window = WebviewInstance::new(self.cfg, self.dom, shared.clone());
+    pub(crate) fn create_window(
+        self,
+        shared: &Rc<SharedContext>,
+    ) -> Result<WebviewInstance, Box<dyn std::error::Error>> {
+        let window = WebviewInstance::new(self.cfg, self.dom, shared.clone())?;
 
         let cx = window
             .dom
             .in_scope(ScopeId::ROOT, consume_context::<Rc<DesktopService>>);
         _ = self.sender.send(cx);
 
-        window
+        Ok(window)
     }
 }

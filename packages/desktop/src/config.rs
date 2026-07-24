@@ -1,6 +1,5 @@
 use dioxus_core::{LaunchConfig, VirtualDom};
-use std::path::PathBuf;
-use std::{borrow::Cow, sync::Arc};
+use std::{any::Any, borrow::Cow, error::Error, path::PathBuf, sync::Arc};
 use tao::window::{Icon, WindowBuilder};
 use tao::{
     event_loop::{EventLoop, EventLoopWindowTarget},
@@ -23,6 +22,8 @@ type CustomEventHandler = Box<
 /// A function taking a URL and returning whether the webview should navigate to it or open it in
 /// the browser. If missing in the config, all URLs will be allowed.
 type NavigationHandler = Box<dyn Fn(&str) -> bool + 'static>;
+type WindowCreationGuardResult = Result<Box<dyn Any>, Box<dyn Error>>;
+type WindowCreationGuardFactory = Box<dyn FnOnce() -> WindowCreationGuardResult>;
 
 /// The closing behaviour of specific application window.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -75,6 +76,7 @@ pub struct Config {
     pub(crate) additional_windows_args: Option<String>,
     pub(crate) tray_icon_show_window_on_click: bool,
     pub(crate) navigation_handler: Option<NavigationHandler>,
+    pub(crate) window_creation_guard_factory: Option<WindowCreationGuardFactory>,
 
     #[allow(clippy::type_complexity)]
     pub(crate) on_window: Option<Box<dyn FnMut(Arc<Window>, &mut VirtualDom) + 'static>>,
@@ -130,6 +132,35 @@ impl Config {
             additional_windows_args: None,
             tray_icon_show_window_on_click: true,
             navigation_handler: None,
+            window_creation_guard_factory: None,
+        }
+    }
+
+    /// Defers an RAII guard until native window creation starts.
+    ///
+    /// The guard spans Tao and Wry creation so hosts can hold native thread state across both.
+    pub fn with_window_creation_guard<G, E>(
+        mut self,
+        factory: impl FnOnce() -> Result<G, E> + 'static,
+    ) -> Self
+    where
+        G: 'static,
+        E: Error + 'static,
+    {
+        self.window_creation_guard_factory = Some(Box::new(move || {
+            factory()
+                .map(|guard| Box::new(guard) as Box<dyn Any>)
+                .map_err(|error| Box::new(error) as Box<dyn Error>)
+        }));
+        self
+    }
+
+    pub(crate) fn try_enter_window_creation_guard(
+        &mut self,
+    ) -> Result<Option<Box<dyn Any>>, Box<dyn Error>> {
+        match self.window_creation_guard_factory.take() {
+            Some(factory) => factory().map(Some),
+            None => Ok(None),
         }
     }
 
@@ -368,6 +399,65 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod window_creation_guard_tests {
+    use super::Config;
+    use std::{cell::Cell, convert::Infallible, rc::Rc};
+
+    struct DropProbe(Rc<Cell<bool>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn guard_acquisition_is_deferred_and_uses_raii() {
+        let entered = Rc::new(Cell::new(false));
+        let dropped = Rc::new(Cell::new(false));
+        let entered_for_factory = Rc::clone(&entered);
+        let dropped_for_factory = Rc::clone(&dropped);
+        let mut config = Config::new().with_window_creation_guard(move || {
+            entered_for_factory.set(true);
+            Result::<DropProbe, Infallible>::Ok(DropProbe(dropped_for_factory))
+        });
+
+        assert!(!entered.get());
+        let guard = match config.try_enter_window_creation_guard() {
+            Ok(Some(guard)) => guard,
+            Ok(None) => panic!("configured guard factory must produce a guard"),
+            Err(error) => panic!("guard factory must succeed: {error}"),
+        };
+        assert!(entered.get());
+        assert!(!dropped.get());
+
+        drop(guard);
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn guard_spans_tao_and_wry_creation_and_native_errors_propagate() {
+        let source = include_str!("webview.rs");
+        let guard = source
+            .find("let window_creation_guard = cfg.try_enter_window_creation_guard()?;")
+            .unwrap_or_else(|| panic!("guard must be entered before native creation"));
+        let tao = source
+            .find("window.build(&shared.target)?")
+            .unwrap_or_else(|| panic!("Tao creation failures must propagate"));
+        let wry = source
+            .find("let webview = webview?;")
+            .unwrap_or_else(|| panic!("Wry creation failures must propagate"));
+        let restore = source
+            .find("drop(window_creation_guard);")
+            .unwrap_or_else(|| panic!("guard must be restored after Wry creation"));
+
+        assert!(guard < tao);
+        assert!(tao < wry);
+        assert!(wry < restore);
     }
 }
 

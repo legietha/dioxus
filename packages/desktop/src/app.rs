@@ -185,7 +185,13 @@ impl App {
 
     pub fn handle_new_window(&mut self) {
         for pending_webview in self.shared.pending_webviews.borrow_mut().drain(..) {
-            let window = pending_webview.create_window(&self.shared);
+            let window = match pending_webview.create_window(&self.shared) {
+                Ok(window) => window,
+                Err(error) => {
+                    tracing::error!("native window creation failed: {error}");
+                    continue;
+                }
+            };
             let id = window.desktop_context.window.id();
             self.webviews.insert(id, window);
             _ = self.shared.proxy.send_event(UserWindowEvent::Poll(id));
@@ -263,7 +269,14 @@ impl App {
         let explicit_window_size = cfg.window.window.inner_size;
         let explicit_window_position = cfg.window.window.position;
 
-        let webview = WebviewInstance::new(cfg, virtual_dom, self.shared.clone());
+        let webview = match WebviewInstance::new(cfg, virtual_dom, self.shared.clone()) {
+            Ok(webview) => webview,
+            Err(error) => {
+                tracing::error!("initial native window creation failed: {error}");
+                self.control_flow = tao::event_loop::ControlFlow::Exit;
+                return;
+            }
+        };
 
         // And then attempt to resume from state
         self.resume_from_state(&webview, explicit_window_size, explicit_window_position);
